@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import copy
 import typing as t
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -131,6 +132,40 @@ class TapAirbyte(Tap):
                 " by running the the tap with the `--about` flag and the `--config` flag pointing"
                 " to a file containing the `airbyte_spec` configuration. This is a JSON object."
             ),
+        ),
+        th.Property(
+            "nullable_generated_fields",
+            th.ArrayType(th.StringType),
+            required=False,
+            description=(
+                "These are generated fields that are nullable. This tends to happen with"
+                " `_ab_cdc_deleted_at`. This is needed because some of the airbyte"
+                " connectors may not properly add that some of the generated fields"
+                " need to be nullable. This is an array of strings like `<table>.<field>`"
+                " the `<table>` value could also be `*`."
+            ),
+            default=[],
+        ),
+        th.Property(
+            "include_docker_args_double_dash",
+            th.BooleanType(),
+            required=False,
+            description=(
+                "At some point some airbyte connectors changed to not needing `--`"
+                " when invoking the connector from docker. By default this tap"
+                " doesn't include the `--` when invoking docker"
+            ),
+            default=False,
+        ),
+        th.Property(
+            "force_docker_as_current_user",
+            th.BooleanType(),
+            required=False,
+            description=(
+                "Forces the airbyte connector's docker container to run as the current"
+                " user. Only works if running docker as root."
+            ),
+            default=False,
         ),
         th.Property(
             "docker_mounts",
@@ -361,10 +396,15 @@ class TapAirbyte(Tap):
         self, *airbyte_cmd: str, docker_args: t.Optional[t.List[str]] = None
     ) -> t.List[t.Union[str, Path]]:
         """Construct the command to run the Airbyte connector."""
-        return (
-            [self.venv / "bin" / self.source_name, *airbyte_cmd]
-            if self.is_native()
-            else [
+        docker_airbyte_cmd = [
+            "docker",
+            "run",
+            *(docker_args or []),
+            f"{self.image}:{self.tag}",
+            *airbyte_cmd,
+        ]
+        if self.config.get("include_docker_args_double_dash", False):
+            docker_airbyte_cmd = [
                 "docker",
                 "run",
                 *(docker_args or []),
@@ -372,7 +412,13 @@ class TapAirbyte(Tap):
                 "--",
                 *airbyte_cmd,
             ]
+
+        command = (
+            [self.venv / "bin" / self.source_name, *airbyte_cmd]
+            if self.is_native()
+            else docker_airbyte_cmd
         )
+        return command
 
     @property
     def venv(self) -> Path:
@@ -458,6 +504,7 @@ class TapAirbyte(Tap):
                         "-v",
                         f"{host_tmpdir}:{self.airbyte_mount_dir}",
                         *self.docker_mounts,
+                        *self.docker_additional_args,
                     ],
                 ),
                 stdout=subprocess.PIPE,
@@ -505,6 +552,7 @@ class TapAirbyte(Tap):
     def run_read(self) -> t.Iterator[subprocess.Popen]:
         """Run the read command for the Airbyte connector."""
         with TemporaryDirectory() as host_tmpdir:
+            self.logger.info(f"Created temporary directory at {host_tmpdir}")
             with (
                 open(f"{host_tmpdir}/config.json", "wb") as config,
                 open(f"{host_tmpdir}/catalog.json", "wb") as catalog,
@@ -530,6 +578,7 @@ class TapAirbyte(Tap):
                         "-v",
                         f"{host_tmpdir}:{self.airbyte_mount_dir}",
                         *self.docker_mounts,
+                        *self.docker_additional_args,
                     ],
                 ),
                 stdout=subprocess.PIPE,
@@ -599,6 +648,14 @@ class TapAirbyte(Tap):
         return self._tag
 
     @property
+    def docker_additional_args(self) -> t.List[str]:
+        if self.config.get("force_docker_as_current_user", False):
+            uid = os.getuid()
+            gid = os.getgid()
+            return ["--user", f"{uid}:{gid}"]
+        return []
+
+    @property
     def docker_mounts(self) -> t.List[str]:
         """Get the Docker mounts for the Airbyte connector."""
         if not self._docker_mounts:
@@ -622,9 +679,11 @@ class TapAirbyte(Tap):
     def airbyte_catalog(self) -> t.Dict[str, t.Any]:
         """Get the Airbyte catalog."""
         with TemporaryDirectory() as host_tmpdir:
+            self.logger.info(f"Created temporary directory at {host_tmpdir}")
             with open(f"{host_tmpdir}/config.json", "wb") as f:
                 f.write(orjson.dumps(self.config.get("airbyte_config", {})))
             runtime_conf_dir = host_tmpdir if self.is_native() else self.airbyte_mount_dir
+
             proc = subprocess.run(
                 self.to_command(
                     "discover",
@@ -636,6 +695,7 @@ class TapAirbyte(Tap):
                         "-v",
                         f"{host_tmpdir}:{self.airbyte_mount_dir}",
                         *self.docker_mounts,
+                        *self.docker_additional_args,
                     ],
                 ),
                 stdout=subprocess.PIPE,
@@ -649,7 +709,44 @@ class TapAirbyte(Tap):
             if message["type"] in (AirbyteMessage.LOG, AirbyteMessage.TRACE):
                 self._process_log_message(message)
             elif message["type"] == AirbyteMessage.CATALOG:
-                return message["catalog"]
+                catalog = message["catalog"]
+                streams = catalog["streams"]
+                rewritten_streams = []
+
+                # Process the nullable configurations
+                nullable_generated_fields = self.config.get("nullable_generated_fields", [])
+                search_fields = []
+                for field in nullable_generated_fields:
+                    search_field = field.strip().split(".")
+                    # Hack for now. Validating configuration should happen elsewhere
+                    if len(search_field) != 2:
+                        raise Exception(
+                            f'Invalid nullable_generated_fields configuration "{field}"'
+                        )
+                    search_fields.append((search_field[0], search_field[1]))
+
+                for s in streams:
+                    stream = copy.deepcopy(s)
+                    properties = stream.get("json_schema", {}).get("properties", {})
+                    stream_name = stream["name"]
+                    for search_stream_name, search_field_name in search_fields:
+                        if search_stream_name != "*" and search_stream_name != stream_name:
+                            continue
+                        if search_field_name in properties:
+                            prop = properties.get(search_field_name)
+                            current_type = prop["type"]
+                            rewritten_type = ["null"]
+                            if type(current_type) == list:
+                                rewritten_type.extend(current_type)
+                            else:
+                                rewritten_type.append(current_type)
+                            prop["type"] = rewritten_type
+                            properties[search_field_name] = prop
+                    rewritten_streams.append(stream)
+
+                new_catalog = {"streams": rewritten_streams}
+
+                return new_catalog
         if proc.returncode != 0:
             raise AirbyteException(
                 f"Discover failed with return code {proc.returncode}: {proc.stderr.decode()}"
